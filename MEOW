@@ -1,0 +1,641 @@
+"""Penrose plots: python penrose_diagram.py
+For an image: python penrose_diagram.py --mode both --save penrose.png
+"""
+
+import argparse
+from datetime import datetime
+from pathlib import Path
+import textwrap
+import time as clock
+
+import matplotlib
+import numpy as np
+
+
+INK = "#e3edff"
+MUTED = "#8d9fbf"
+GRID = "#22334e"
+BLUE = "#58d9ff"
+ORANGE = "#ffbc62"
+RED = "#ff657f"
+GREEN = "#6aebcf"
+PAPER = "#080e1b"
+PANEL = "#142139"
+
+
+def glow(ax, x, y, color, width=1.6, z=6):
+    layers = []
+    for gain, opacity in ((5, .055), (2.5, .16), (1, .95)):
+        line, = ax.plot(x, y, color=color, lw=width*gain, alpha=opacity,
+                        solid_capstyle="round", zorder=z)
+        layers.append(line)
+    return layers
+
+
+def lights(ax, event, mode):
+    pulses = []
+    for direction in (-1, 1):
+        path = shoot(*event, direction, mode)
+        heads = []
+        for size, alpha in ((25, .06), (13, .20), (4, 1)):
+            dot, = ax.plot([], [], "o", ms=size, color=ORANGE, alpha=alpha, zorder=12)
+            heads.append(dot)
+        pulses.append(dict(path=path, tail=glow(ax, [], [], ORANGE, 2.2, 11),
+                           heads=heads, end=ends_at(path[-1], mode)))
+    return pulses
+
+
+def advance(pulses, phase):
+    longest = max(p['path'][1,1]-p['path'][0,1] for p in pulses)
+    for p in pulses:
+        (x,t), (xe,te) = p['path']
+        length = te-t
+        s = min(max(phase,0)*longest, length)
+        trail = np.linspace(max(0,s-.12), s, 18)
+        direction = 1 if xe > x else -1
+        for line in p['tail']:
+            line.set_data(x+direction*trail, t+trail)
+        arrived = s >= length-1e-10
+        color = RED if arrived and p['end'] == 'future singularity' else ORANGE
+        for j,dot in enumerate(p['heads']):
+            dot.set_data([x+direction*s], [t+s])
+            dot.set_color(color)
+            dot.set_markersize((25,13,4)[j] * (1.25 if arrived else 1))
+
+
+def clear_lights(pulses):
+    for p in pulses:
+        for artist in p['tail'] + p['heads']:
+            artist.remove()
+
+
+def check_speed(beta):
+  beta = float(beta)
+  if not np.isfinite(beta) or abs(beta) >= 1:
+    raise ValueError('A massive traveler needs a finite speed with |v/c| < 1.')
+  return beta
+
+
+def pack(u, v):
+  u, v = np.asarray(u, dtype=float), np.asarray(v, dtype=float)
+  if np.isnan(u).any() or np.isnan(v).any():
+    raise ValueError('Null coordinates cannot contain NaN.')
+  # Infinite null coordinates are allowed: those limits define the boundary.
+  a, b = np.arctan(u), np.arctan(v)
+  return (b-a)/np.pi, (a+b)/np.pi
+
+
+def flat_xy(t, x):
+  t, x = np.asarray(t, dtype=float), np.asarray(x, dtype=float)
+  return pack(t-x, t+x)
+
+
+def edges(mode):
+  if mode not in ('flat', 'black-hole'):
+    raise ValueError(f'Unknown spacetime: {mode!r}')
+  bounds = [(1,1,1), (-1,1,1), (1,-1,1), (-1,-1,1)]
+  return bounds if mode == 'flat' else bounds + [(0,1,.5), (0,-1,.5)]
+
+
+def inside(x, t, mode, margin=0):
+  bounds = edges(mode)
+  try:
+    x, t, margin = float(x), float(t), float(margin)
+  except (TypeError, ValueError):
+    return False
+  if not np.isfinite([x, t, margin]).all() or margin < 0:
+    return False
+  return all(a*x + b*t < c-margin for a,b,c in bounds)
+
+
+def shoot(x, t, direction, mode):
+  if direction not in (-1, 1) or isinstance(direction, (bool, np.bool_)):
+    raise ValueError('Choose a light-ray direction of -1 or +1.')
+  if not inside(x, t, mode):
+    raise ValueError('The source must be a finite event inside the diagram.')
+  x, t = float(x), float(t)
+  stop = np.inf
+  for a,b,c in edges(mode):
+    rate = a*direction + b
+    if rate > 0:
+      stop = min(stop, (c-a*x-b*t)/rate)
+  return np.array([[x,t], [x+direction*stop, t+stop]])
+
+
+def ends_at(endpoint, mode):
+  x, t = map(float, endpoint)
+  gaps = [c-a*x-b*t for a,b,c in edges(mode)]
+  if not np.isfinite([x,t]).all() or min(gaps) < -1e-8 or min(gaps) > 1e-8:
+    raise ValueError('A ray endpoint must lie on the conformal boundary.')
+  if mode == 'black-hole' and abs(t-.5) < 1e-8:
+    return "horizon's endpoint at i+" if abs(abs(x)-.5) < 1e-8 else 'future singularity'
+  if t < -1e-8:
+    raise ValueError('This is a past boundary, not a future light-ray endpoint.')
+  return 'future null infinity'
+
+
+def region(x, t, mode):
+  if not inside(x, t, mode):
+    raise ValueError('This point is outside the physical interior.')
+  x, t = float(x), float(t)
+  if mode == 'flat': return 'Flat spacetime'
+  near = 1e-7
+  if abs(x)+abs(t) < near:
+    return 'Bifurcation sphere'
+  if abs(t-abs(x)) < near: return 'Future horizon'
+  if abs(t+abs(x)) < near: return 'Past horizon'
+  if t > abs(x): return 'II: black-hole interior'
+  if t < -abs(x): return 'IV: white-hole interior'
+  return 'I: right exterior' if x > 0 else 'III: left exterior'
+
+
+def track(mode, beta=.35, samples=900):
+  edges(mode)
+  beta = check_speed(beta)
+  if isinstance(samples, (bool, np.bool_)) or not isinstance(samples, (int, np.integer)) or samples < 3:
+    raise ValueError('Use an integer sample count of at least 3.')
+  if mode == 'flat':
+    t = np.tan(np.linspace(-np.pi/2+1e-5, np.pi/2-1e-5, samples))
+    X, T = flat_xy(t, beta*t)
+    return X, T, None
+
+  # E=1, 2M=1: r^(3/2) decreases linearly with the infaller's proper time.
+  r = np.linspace(8., 1e-8, samples)**(2/3)
+  z = np.sqrt(r)
+  F = lambda q: q**3/3 - q*q/2 + q - np.log1p(q)
+  v = 2*(F(2.)-F(z))
+  V = np.exp(v/2)
+  U = (1-r)*np.exp(r)/V  # Avoid Schwarzschild t, which fails at r=1.
+  X, T = pack(U,V)
+  return X, T, r
+
+
+def backdrop(ax, mode):
+    from matplotlib.patches import Polygon
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_facecolor(PAPER)
+    ax.set_xlim(-1.14, 1.14)
+    ax.set_ylim((-1.14, 1.14) if mode == "flat" else (-0.72, 0.72))
+    ax.set_xlabel("Compact space X (dimensionless)", color=MUTED, labelpad=10)
+    ax.set_ylabel("Compact time T (dimensionless)", color=MUTED, labelpad=8)
+    ax.tick_params(colors=MUTED, labelsize=9)
+    for spine in ax.spines.values():
+        spine.set_color(GRID)
+    ax.set_xticks([-1, -0.5, 0, 0.5, 1])
+    ax.set_yticks([-1, -0.5, 0, 0.5, 1] if mode == "flat" else [-0.5, 0, 0.5])
+
+    if mode == "flat":
+        vertices = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+    else:
+        vertices = [(-1, 0), (-0.5, 0.5), (0.5, 0.5),
+                    (1, 0), (0.5, -0.5), (-0.5, -0.5)]
+    boundary = Polygon(vertices, closed=True, facecolor=PAPER,
+                       edgecolor=INK, linewidth=1.6, zorder=2)
+    ax.add_patch(boundary)
+    for gain, alpha in ((6,.025), (3,.08)):
+        ax.add_patch(Polygon(vertices, closed=True, fill=False, edgecolor=BLUE,
+                             linewidth=gain, alpha=alpha, zorder=2))
+
+    def label(x, t, value, **kwargs):
+        ax.text(x, t, value, ha="center", va="center", color=MUTED,
+                fontsize=kwargs.pop("fontsize", 10), zorder=8, **kwargs)
+
+    if mode == "flat":
+        t_grid = np.tan(np.linspace(-np.pi / 2 + 1e-4,
+                                    np.pi / 2 - 1e-4, 700))
+        for position in [-4, -2, -1, 0, 1, 2, 4]:
+            x, time = flat_xy(t_grid, position)
+            ax.plot(x, time, color=GRID, lw=0.7, clip_path=boundary, zorder=3)
+            x, time = flat_xy(position, t_grid)
+            ax.plot(x, time, color=GRID, lw=0.7, clip_path=boundary, zorder=3)
+        label(0, 1.065, r"$i^+$")
+        label(0, -1.065, r"$i^-$")
+        label(-1.065, 0, r"$i^0$")
+        label(1.065, 0, r"$i^0$")
+        null_x, null_t = 0.60, 0.49
+        ax.set_title("Flat spacetime | 1 space + 1 time", loc="left",
+                     fontsize=12, color=INK, pad=18)
+    else:
+        ax.add_patch(Polygon([(0,0),(-.5,.5),(.5,.5)], facecolor=RED,
+                             edgecolor="none", alpha=.055, zorder=2))
+        ax.add_patch(Polygon([(0,0),(-.5,-.5),(.5,-.5)], facecolor="#ab8bff",
+                             edgecolor="none", alpha=.06, zorder=2))
+        for shift in np.linspace(-.8,.8,9):
+            for sign in (-1,1):
+                ax.plot([-1.1,1.1],[-1.1*sign+shift,1.1*sign+shift],
+                        color=GRID,lw=.55,alpha=.45,clip_path=boundary,zorder=2)
+        # U=0 and V=0 become T=X and T=-X.
+        for sign in [-1, 1]:
+            ax.plot([-.5,.5],[-.5*sign,.5*sign], color=GREEN, lw=7, alpha=.055, zorder=4)
+            ax.plot([-0.5, 0.5], [-0.5 * sign, 0.5 * sign],
+                    "--", color=GREEN, lw=1.7, zorder=4)
+        for sign in [-1, 1]:
+            x = np.linspace(-0.5, 0.5, 81)
+            teeth = np.where(np.arange(len(x)) % 2 == 0, 0.0, 0.009)
+            ax.plot(x, sign*(.5+teeth), color=RED, lw=7, alpha=.08, zorder=7)
+            ax.plot(x, sign * (0.5 + teeth), color=RED, lw=1.5, zorder=7)
+        label(0, 0.57, r"$r=0$ | future singularity")
+        label(0, -0.57, r"$r=0$ | past singularity")
+        label(0, 0.15, "II\nBlack hole", fontsize=9)
+        label(0, -0.28, "IV  WHITE HOLE")
+        label(-0.68, 0, "III\nSecond exterior")
+        label(0.69, -0.12, "I\nExterior")
+        for sign in [-1, 1]:
+            label(sign * 1.065, 0, r"$i^0$")
+            label(sign * 0.51, 0.57, r"$i^+$")
+            label(sign * 0.51, -0.57, r"$i^-$")
+        null_x, null_t = 0.80, 0.29
+        ax.set_title("Eternal Schwarzschild black hole | radial view", loc="left",
+                     fontsize=12, color=INK, pad=18)
+
+    for sign in [-1, 1]:
+        label(sign * null_x, null_t, r"$\mathscr{I}^{+}$", rotation=-sign * 45)
+        label(sign * null_x, -null_t, r"$\mathscr{I}^{-}$", rotation=sign * 45)
+    return boundary
+
+
+def emit_rays(ax, event, mode, boundary):
+    from matplotlib.patches import Polygon
+
+    x, t = event
+    artists = []
+    future = Polygon([(x, t), (x - 4, t + 4), (x + 4, t + 4)],
+                     facecolor=ORANGE, alpha=0.075, edgecolor="none", zorder=3)
+    future.set_clip_path(boundary)
+    ax.add_patch(future)
+    artists.append(future)
+    destinations = []
+    for direction in [-1, 1]:
+        ray = shoot(x, t, direction, mode)
+        line, = ax.plot(ray[:, 0], ray[:, 1], color=ORANGE, lw=1.2, alpha=.35,
+                        zorder=6, solid_capstyle="round")
+        artists.append(line)
+        destinations.append(ends_at(ray[-1], mode))
+    halo, = ax.plot(x,t,"o",color=ORANGE,markersize=20,alpha=.10,zorder=9)
+    point, = ax.plot(x, t, "o", color=ORANGE, markersize=5, zorder=10)
+    tag = ax.annotate("A", (x, t), xytext=(8, -15), textcoords="offset points",
+                      color=ORANGE, fontsize=11, weight="bold", zorder=11,
+                      bbox=dict(facecolor=PAPER, edgecolor="none", alpha=0.85, pad=1))
+    artists.extend([halo, point, tag])
+    return artists, destinations
+
+
+def start_at(mode):
+    return (0.0, 0.0) if mode == "flat" else (0.0, 0.27)
+
+
+def save_plot(destination, mode="both", beta=0.35, event=None, progress=0.65):
+    if mode not in ("flat", "black-hole", "both"):
+        raise ValueError(f"Unknown spacetime: {mode!r}")
+    beta = check_speed(beta)
+    if not np.isfinite(progress) or not 0 <= progress <= 1:
+        raise ValueError("Path progress must be finite and between 0 and 1.")
+    if event is not None and mode != "both" and not inside(*event, mode):
+        raise ValueError("Select an event inside the diagram before exporting.")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    modes = ["flat", "black-hole"] if mode == "both" else [mode]
+    fig, axes = plt.subplots(1, len(modes), figsize=(14, 7) if len(modes) == 2 else (8, 8))
+    fig.set_facecolor(PAPER)
+    for ax, current in zip(np.atleast_1d(axes), modes):
+        boundary = backdrop(ax, current)
+        x, time, _ = track(current, beta)
+        glow(ax, x, time, BLUE, 1.5, 5)
+        index = min(int(progress * (len(x) - 1)), len(x) - 1)
+        ax.plot(x[index], time[index], "o", color=BLUE, markersize=6, zorder=9)
+        selected = event if event is not None and mode != "both" else start_at(current)
+        emit_rays(ax, selected, current, boundary)
+        advance(lights(ax, selected, current), .64)
+    handles = [Line2D([], [], color=BLUE, lw=2, label="Massive traveler"),
+               Line2D([], [], color=ORANGE, lw=2, label="Light from A"),
+               Line2D([], [], color=GREEN, lw=1.7, ls="--", label="Horizons"),
+               Line2D([], [], color=RED, lw=1.5, label="Singularities")]
+    fig.suptitle("PENROSE DIAGRAMS", fontsize=18, color=INK, y=0.97)
+    fig.legend(handles=handles, loc="lower center", ncol=4, frameon=False,
+               bbox_to_anchor=(0.5, 0.045), fontsize=10, labelcolor=INK)
+    fig.text(0.5, 0.018,
+             "Causal geometry: distances are distorted. The eternal black-hole model includes a white hole and a second exterior.",
+             ha="center", fontsize=9, color=MUTED)
+    fig.tight_layout(rect=(0.015, 0.11, 0.985, 0.92), w_pad=3)
+    path = Path(destination).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180, facecolor=PAPER)
+    plt.close(fig)
+    return path.resolve()
+
+
+class PlotWindow:
+    def __init__(self, mode="black-hole", beta=0.35, fast=None):
+        import matplotlib.pyplot as plt
+        from matplotlib.widgets import Button, RadioButtons, Slider
+
+        edges(mode)
+        self.mode, self.beta = mode, check_speed(beta)
+        self.progress = 0.65
+        self.playing = True
+        self.pulses = []
+        self.pulse_phase = 0.
+        self.last_tick = clock.perf_counter()
+        self._frame = False
+        self.event = start_at(mode)
+        self.rays = []
+        self.fig = plt.figure(figsize=(12, 8), facecolor=PAPER)
+        self.fast = (self.fig.canvas.supports_blit and matplotlib.get_backend().lower() != 'agg') if fast is None else fast
+        self._bg, self._moving = None, []
+        self.fig.canvas.manager.set_window_title("Penrose Diagram Explorer")
+        sky = self.fig.add_axes((0,0,1,1), zorder=-1)
+        rng = np.random.default_rng(12)
+        sky.scatter(rng.random(160),rng.random(160),s=rng.uniform(.3,3,160),
+                    c=MUTED,alpha=.20,edgecolors="none")
+        sky.set(xlim=(0,1),ylim=(0,1),facecolor=PAPER)
+        sky.set_axis_off()
+        self.ax = self.fig.add_axes((0.075, 0.255, 0.60, 0.56))
+        self.fig.text(0.075, 0.94, "PENROSE  /  Light & spacetime", color=INK,
+                      fontsize=21, weight="bold")
+        self.fig.text(0.075, 0.90,
+                      "Click to launch light paths. Follow the traveler across the horizon.",
+                      color=MUTED, fontsize=10)
+
+        radio_ax = self.fig.add_axes((0.75, 0.76, 0.22, 0.12), facecolor=PAPER)
+        radio_ax.set_title("Spacetime", loc="left", fontsize=12, color=INK)
+        self.radio = RadioButtons(radio_ax, ("Flat spacetime", "Black hole"),
+                                  active=0 if mode == "flat" else 1, activecolor=BLUE)
+        for label in self.radio.labels:
+            label.set_color(INK)
+        for spine in radio_ax.spines.values():
+            spine.set_visible(False)
+        self.radio.on_clicked(self.switch)
+
+        self.info = self.fig.text(0.75, 0.70, "", va="top", color=INK,
+                                  fontsize=10, linespacing=1.5)
+        self.badge = self.fig.text(.75,.735,"",fontsize=9,weight="bold",color=RED)
+        self.readout = self.fig.text(.75,.39,"",color=BLUE,fontsize=11)
+        for y, label, color in ((.32,"TRAVELER   Glowing trail",BLUE),
+                                 (.292,"LIGHT   Moving pulses",ORANGE),
+                                 (.264,"HORIZON   Dashed boundary",GREEN),
+                                 (.236,"SINGULARITY   Red boundary",RED)):
+            self.fig.text(.75,y,label,color=color,fontsize=9)
+
+        progress_ax = self.fig.add_axes((0.22, 0.165, 0.43, 0.025))
+        speed_ax = self.fig.add_axes((0.22, 0.115, 0.43, 0.025))
+        self.scrub = Slider(progress_ax, "Path progress", 0, 1,
+                                       valinit=self.progress, valfmt="%1.2f", color=BLUE)
+        self.speed = Slider(speed_ax, "Flat speed v/c", min(-0.95, self.beta), max(0.95, self.beta),
+                                    valinit=self.beta, valfmt="%1.2f", color=BLUE)
+        self.scrub.on_changed(self.seek)
+        self.speed.on_changed(self.speed_changed)
+        self.scrub.drawon = False
+        for slider in (self.scrub,self.speed):
+            slider.label.set_color(MUTED)
+            slider.valtext.set_color(INK)
+        self.bh_note = self.fig.text(0.22, 0.123,
+              "Black-hole path: radial free fall, E = 1, horizon radius = 1.",
+              fontsize=9, color=MUTED)
+
+        self.go = Button(self.fig.add_axes((0.75, 0.155, 0.17, 0.045)), "Pause traveler",color=PANEL,hovercolor="#243a57")
+        self.reset_btn = Button(self.fig.add_axes((0.75, 0.095, 0.065, 0.04)), "Reset",color=PANEL,hovercolor="#243a57")
+        self.save_btn = Button(self.fig.add_axes((0.83, 0.095, 0.10, 0.04)), "Save PNG",color=PANEL,hovercolor="#243a57")
+        for button in (self.go,self.reset_btn,self.save_btn):
+            button.label.set_color(INK)
+            for spine in button.ax.spines.values(): spine.set_color(GRID)
+        self.go.on_clicked(self.play)
+        self.reset_btn.on_clicked(self.reset)
+        self.save_btn.on_clicked(self.save)
+        self.message = self.fig.text(0.075, 0.045,
+                "SPACE: traveler play/pause   |   R: reset   |   Pulses replay null paths; playback is not a physical clock.",
+                fontsize=9, color=MUTED)
+        self.fig.canvas.mpl_connect("button_press_event", self.pick)
+        self.fig.canvas.mpl_connect("key_press_event", self.key)
+        self.timer = self.fig.canvas.new_timer(interval=33)
+        self.timer.add_callback(self.step)
+        self.fig.canvas.mpl_connect("close_event", lambda event: self.timer.stop())
+        self.fig.canvas.mpl_connect("draw_event", self.cache_frame)
+        self.draw()
+        self.timer.start()
+
+    def draw(self):
+        self.ax.clear()
+        self.rays = []
+        self.pulses = []
+        self.boundary = backdrop(self.ax, self.mode)
+        self.xs, self.ts, self.r = track(self.mode, self.beta)
+        self.ax.plot(self.xs, self.ts, color=BLUE, alpha=0.25, lw=2, zorder=5)
+        self.tail = glow(self.ax, [], [], BLUE, 2.1, 8)
+        self.halo = []
+        for size,alpha in ((27,.045),(15,.16),(5,1)):
+            dot, = self.ax.plot([],[],"o",color=BLUE,ms=size,alpha=alpha,zorder=12)
+            self.halo.append(dot)
+        self.speed.ax.set_visible(self.mode == "flat")
+        self.speed.set_active(self.mode == "flat")
+        self.bh_note.set_visible(self.mode == "black-hole")
+        self.move()
+        self.emit()
+
+    def move(self):
+        pos = self.progress*(len(self.xs)-1)
+        index = min(int(pos),len(self.xs)-1)
+        j = min(index+1,len(self.xs)-1)
+        f = pos-index
+        x = self.xs[index]*(1-f)+self.xs[j]*f
+        t = self.ts[index]*(1-f)+self.ts[j]*f
+        a = max(0,index-100)
+        for line in self.tail:
+            line.set_data(np.r_[self.xs[a:index+1],x],np.r_[self.ts[a:index+1],t])
+        for dot in self.halo: dot.set_data([x],[t])
+        if self.r is None:
+            self.readout.set_text(f"TRAVELER   v/c = {self.beta:+.2f}")
+            self.readout.set_color(BLUE)
+        else:
+            radius = self.r[index]*(1-f)+self.r[j]*f
+            self.readout.set_text(f"TRAVELER   r / horizon = {radius:.2f}")
+            self.readout.set_color(RED if radius < 1 else BLUE)
+        if not self._frame: self.fig.canvas.draw_idle()
+
+    def emit(self):
+        clear_lights(self.pulses)
+        for artist in self.rays:
+            artist.remove()
+        self.rays, destinations = emit_rays(
+            self.ax, self.event, self.mode, self.boundary)
+        self.pulses = lights(self.ax,self.event,self.mode)
+        self.pulse_phase = 0.
+        advance(self.pulses,0.)
+        location = region(*self.event, self.mode)
+        escapes = destinations.count('future null infinity')
+        self.badge.set_text('NO ESCAPE TO INFINITY' if not escapes else f'{escapes} ESCAPE PATH' + ('S' if escapes > 1 else ''))
+        self.badge.set_color(GREEN if escapes else RED)
+        lines = ["SELECTED EVENT  A", location, "", "LIGHT DESTINATIONS"]
+        for side, destination in zip(("Left", "Right"), destinations):
+            lines.append(textwrap.fill(f"{side}: {destination}", width=29))
+        if self.mode == "black-hole":
+            lines += ["", "Idealized eternal solution.", "Angular dimensions omitted."]
+        else:
+            lines += ["", "One spatial dimension.", "No gravity; c = 1."]
+        self.info.set_text("\n".join(lines))
+        self.prepare_motion()
+        self.fig.canvas.draw_idle()
+
+    def prepare_motion(self):
+        self._bg = None
+        self._moving = self.tail + self.halo + [self.readout,self.scrub.ax,self.go.ax]
+        for p in self.pulses: self._moving += p['tail'] + p['heads']
+        for artist in self._moving: artist.set_animated(self.fast)
+
+    def cache_frame(self, event):
+        if self.fast and self._moving:
+            self._bg = self.fig.canvas.copy_from_bbox(self.fig.bbox)
+            self.paint_motion()
+
+    def paint_motion(self):
+        if not self.fast or self._bg is None:
+            self.fig.canvas.draw_idle()
+            return
+        self.fig.canvas.restore_region(self._bg)
+        for artist in self._moving: self.fig.draw_artist(artist)
+        self.fig.canvas.blit(self.fig.bbox)
+
+    def switch(self, label):
+        choices = {"Flat spacetime": "flat", "Black hole": "black-hole"}
+        if label not in choices:
+            raise ValueError(f"Unknown view: {label!r}")
+        self.mode = choices[label]
+        self.event = start_at(self.mode)
+        self.draw()
+
+    def speed_changed(self, value):
+        self.beta = check_speed(value)
+        if self.mode == "flat":
+            self.draw()
+
+    def seek(self, value):
+        pos = float(value)
+        if not np.isfinite(pos) or not 0 <= pos <= 1:
+            raise ValueError("Path progress must be between 0 and 1.")
+        self.progress = pos
+        self.move()
+
+    def pick(self, event):
+        if event.inaxes is not self.ax or event.button != 1:
+            return
+        if self.fig.canvas.toolbar is not None and self.fig.canvas.toolbar.mode:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        if inside(event.xdata, event.ydata, self.mode, margin=1e-4):
+            self.event = (float(event.xdata), float(event.ydata))
+            self.emit()
+
+    def play(self, event=None):
+        self.playing = not self.playing
+        self.go.label.set_text("Pause traveler" if self.playing else "Play traveler")
+        if self.playing:
+            if self.progress >= 1:
+                self.scrub.set_val(0)
+        self.fig.canvas.draw_idle()
+
+    def step(self):
+        now = clock.perf_counter()
+        dt = min(.15,max(0,now-self.last_tick))
+        self.last_tick = now
+        self._frame = True
+        if self.playing:
+            self.scrub.set_val(min(1.,self.progress+dt/16))
+            if self.progress >= 1:
+                self.playing = False
+                self.go.label.set_text("Replay traveler")
+        self.pulse_phase = (self.pulse_phase+dt/2.8) % 1.25
+        advance(self.pulses,self.pulse_phase)
+        self._frame = False
+        self.paint_motion()
+
+    def key(self, event):
+        if event.key == ' ': self.play()
+        elif event.key in ('r','R'): self.reset()
+
+    def reset(self, event=None):
+        if self.playing:
+            self.play()
+        self.event = start_at(self.mode)
+        self.scrub.set_val(0.65)
+        self.speed.set_val(0.35)
+        self.draw()
+
+    def save(self, event=None):
+        name = f"penrose_{self.mode}_{datetime.now():%Y%m%d_%H%M%S_%f}.png"
+        try:
+            path = save_plot(name, self.mode, self.beta, self.event, self.progress)
+        except (OSError, ValueError) as error:
+            self.message.set_text(f"Could not save the image: {error}")
+        else:
+            self.message.set_text(f"Saved: {path.name}")
+            print(f"Saved: {path}")
+        self.fig.canvas.draw_idle()
+
+
+def make_gif(destination, mode='black-hole', beta=.35, frames=72):
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, PillowWriter
+
+    edges(mode)
+    if not isinstance(frames,int) or frames < 2:
+        raise ValueError('An animation needs at least two frames.')
+    path = Path(destination).expanduser()
+    path.parent.mkdir(parents=True,exist_ok=True)
+    app = PlotWindow(mode,beta,fast=False)
+    app.timer.stop()
+    app.playing = False
+    app.go.label.set_text('Traveler preview')
+
+    def frame(k):
+        f = k/(frames-1)
+        app._frame = True
+        app.scrub.set_val(.58+.42*f)
+        advance(app.pulses,1.25*f)
+        app._frame = False
+        return app._moving
+
+    movie = FuncAnimation(app.fig,frame,frames=frames,interval=1000/18,blit=False,
+                          cache_frame_data=False)
+    try:
+        movie.save(path,writer=PillowWriter(fps=18),dpi=85)
+    finally:
+        plt.close(app.fig)
+    return path.resolve()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--mode", choices=("flat", "black-hole", "both"), default="black-hole")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--save", metavar="IMAGE.png", help="Export instead of opening a window.")
+    output.add_argument("--gif", metavar="MOVIE.gif", help="Render an animated preview.")
+    parser.add_argument("--speed", type=float, default=0.35, help="Flat-spacetime v/c; must be between -1 and 1.")
+    args = parser.parse_args()
+    if not np.isfinite(args.speed) or not -1 < args.speed < 1:
+        parser.error("--speed must be finite and strictly between -1 and 1.")
+    if args.mode == "both" and not args.save:
+        parser.error("Use --save IMAGE.png with --mode both; the GUI switches views with its buttons.")
+    if args.gif:
+        if Path(args.gif).suffix.lower() != '.gif':
+            parser.error('--gif needs a filename ending in .gif.')
+        matplotlib.use('Agg')
+        print(f'Saved: {make_gif(args.gif,args.mode,args.speed)}')
+        return
+    if args.save:
+        matplotlib.use("Agg")
+        print(f"Saved: {save_plot(args.save, args.mode, args.speed)}")
+        return
+
+    import matplotlib.pyplot as plt
+
+    if matplotlib.get_backend().lower() in {"agg", "pdf", "ps", "svg", "template", "cairo"}:
+        parser.exit(1, "No interactive desktop backend is available. Run locally, or use --mode both --save penrose.png.\n")
+    app = PlotWindow(args.mode, args.speed)
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
